@@ -1,0 +1,72 @@
+name: Build & Deploy apuestas-service
+
+on:
+  push:
+    branches: [ deploy ]   # solo la rama deploy dispara el pipeline real
+  workflow_dispatch:        # tambien se puede lanzar a mano
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del codigo
+        uses: actions/checkout@v4
+
+      # Credenciales TEMPORALES de AWS Academy (expiran aprox cada 4h)
+      - name: Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login en Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 3 tags simultaneos exigidos: version semantica, latest y sha
+      - name: Construir y subir imagen a ECR
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPO: ${{ secrets.ECR_REPOSITORY }}
+          SHA_TAG: ${{ github.sha }}
+          VERSION_TAG: v1.0.0   # subir manualmente este numero en cada release relevante
+        run: |
+          docker build \
+            -t "$REGISTRY/$REPO:$SHA_TAG" \
+            -t "$REGISTRY/$REPO:latest" \
+            -t "$REGISTRY/$REPO:$VERSION_TAG" \
+            .
+          docker push "$REGISTRY/$REPO:$SHA_TAG"
+          docker push "$REGISTRY/$REPO:latest"
+          docker push "$REGISTRY/$REPO:$VERSION_TAG"
+
+      - name: Instalar kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+
+      - name: Conectar kubectl al cluster EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ secrets.EKS_CLUSTER }}" \
+            --region "${{ secrets.AWS_REGION }}"
+
+      # Sustituye los marcadores y la etiqueta :latest por el sha exacto
+      # recien construido, para desplegar EXACTAMENTE esa imagen.
+      - name: Desplegar en EKS
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          sed -i \
+            "s|<ACCOUNT_ID>|$ACCOUNT_ID|g; s|<REGION>|${{ secrets.AWS_REGION }}|g; s|:latest|:$IMAGE_TAG|g" \
+            k8s/deployment.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/hpa.yaml
+
+      - name: Esperar al rollout
+        run: kubectl rollout status deployment/apuestas-service --timeout=180s
