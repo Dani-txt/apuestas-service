@@ -24,7 +24,7 @@ spec:
               app: apuestas-service
       containers:
         - name: apuestas-service
-          image: <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/apuestas-service:latest
+          image: 248357130561.dkr.ecr.us-east-1.amazonaws.com/apuestas-service:latest
           ports:
             - containerPort: 8005
           env:
