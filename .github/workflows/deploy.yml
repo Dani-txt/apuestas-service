@@ -1,71 +1,67 @@
-name: Build & Deploy apuestas-service
+name: Desplegar microservicios en EKS (CI/CD)
 
 on:
   push:
-    branches: [ deploy ]   # solo la rama deploy dispara el pipeline real
-  workflow_dispatch:        # tambien se puede lanzar a mano
+    branches: [ deploy ]
+  workflow_dispatch:        # también se lanza a mano desde la pestaña Actions
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }} # Corregido a minúscula
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: 1 Checkout del codigo
+      - name: 1. Descargar el codigo del repo
         uses: actions/checkout@v4
 
-      # Credenciales TEMPORALES de AWS Academy (expiran aprox cada 4h)
-      - name: 2 Configurar credenciales de AWS
+      - name: 2. Configurar credenciales de AWS (temporales del lab)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: 3 Login en Amazon ECR
-        id: ecr
+      - name: 3. Login en Amazon ECR
+        id: login-ecr # Le damos un ID claro para usar sus outputs
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 3 tags simultaneos exigidos: version semantica, latest y sha
-      - name: 4. Construir y subir imagen a ECR
+      - name: 4. Construir y subir la imagen
         env:
-          REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
-          REPO: ${{ secrets.ECR_REPOSITORY }}
-          SHA_TAG: ${{ github.sha }}
-          VERSION_TAG: v1.0.0   # subir manualmente este numero en cada release relevante
+          # Usamos el output automático del paso anterior, eliminando la necesidad de AWS_ACCOUNT_ID
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build \
-            -t "$REGISTRY/$REPO:$SHA_TAG" \
-            -t "$REGISTRY/$REPO:latest" \
-            -t "$REGISTRY/$REPO:$VERSION_TAG" \
-            .
-          docker push "$REGISTRY/$REPO:$SHA_TAG"
-          docker push "$REGISTRY/$REPO:latest"
-          docker push "$REGISTRY/$REPO:$VERSION_TAG"
+          docker build -t "$REGISTRY/$REPOSITORY:$IMAGE_TAG" -t "$REGISTRY/$REPOSITORY:latest" .
+          docker push "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+          docker push "$REGISTRY/$REPOSITORY:latest"
 
-      - name: 5. Instalar kubectl
+      - name: 5. Instalar kubectl en el runner
         run: |
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/kubectl
 
-      - name: 6 Conectar kubectl al cluster EKS
-        run: |
-          aws eks update-kubeconfig \
-            --name "${{ secrets.EKS_CLUSTER_NAME }}" \
-            --region "${{ secrets.AWS_REGION }}"
+      - name: 6. Conectar kubectl al cluster
+        run: aws eks update-kubeconfig --name "${{ env.CLUSTER_NAME }}" --region "${{ env.AWS_REGION }}"
 
-      # Sustituye los marcadores y la etiqueta :latest por el sha exacto
-      # recien construido, para desplegar EXACTAMENTE esa imagen.
       - name: 7. Desplegar en EKS
         env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          sed -i \
-            "s|<ACCOUNT_ID>|${{ secrets.AWS_ACCOUNT_ID }}|g; s|<REGION>|${{ secrets.AWS_REGION }}|g; s|:latest|:$IMAGE_TAG|g" \
-            k8s/deployment.yaml
+          # Modificado para que reemplace correctamente usando el formato del registro dinámico
+          sed -i "s|image:.*|image: $REGISTRY/$REPOSITORY:$IMAGE_TAG|g" k8s/deployment.yaml
           kubectl apply -f k8s/deployment.yaml
           kubectl apply -f k8s/service.yaml
           kubectl apply -f k8s/hpa.yaml
- 
-      - name: 8. Esperar al rollout
-        run: kubectl rollout status deployment/apuestas-service --timeout=300s
+
+      - name: 8. Verificar rollout
+        run: |
+          # Nota: Asegúrate de que el deployment en tu archivo yaml se llame exactamente así, o cámbialo por apuestas-service si estás probando ese.
+          kubectl rollout status deployment/estadisticas-service --timeout=300s
+          kubectl get pods -l app=estadisticas-service -o wide
