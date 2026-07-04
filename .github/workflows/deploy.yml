@@ -1,22 +1,102 @@
-name: Desplegar microservicios en EKS (CI/CD)
+name: EFT - test, build, push y deploy a EKS
 
 on:
   push:
     branches: [ deploy ]
-  workflow_dispatch:        # también se lanza a mano desde la pestaña Actions
+  workflow_dispatch:
 
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }} # Corregido a minúscula
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: microservicios-eks
 
 jobs:
-  deploy:
+  # ===========================================================
+  # ETAPA 1 - PRUEBAS UNITARIAS
+  # ===========================================================
+  test:
+    name: Pruebas unitarias (pytest)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [products-service, inventory-service, orders-service]
     steps:
-      - name: 1. Descargar el codigo del repo
+      - name: Checkout del código
         uses: actions/checkout@v4
 
-      - name: 2. Configurar credenciales de AWS (temporales del lab)
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias y correr pytest
+        working-directory: ${{ matrix.service }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pytest
+
+  # ===========================================================
+  # ETAPA 2 - BUILD DE IMÁGENES
+  # ===========================================================
+  build:
+    name: Construir imágenes Docker
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Login en Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build imágenes
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          for svc in products-service inventory-service orders-service; do
+            docker build -t "$REGISTRY/$svc:$IMAGE_TAG" -t "$REGISTRY/$svc:latest" "./$svc"
+          done
+
+  # ===========================================================
+  # ETAPA 3 - PUSH A ECR
+  # ===========================================================
+  push:
+    name: Push a Amazon ECR
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Login en Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push imágenes
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          for svc in products-service inventory-service orders-service; do
+            docker push "$REGISTRY/$svc:$IMAGE_TAG"
+            docker push "$REGISTRY/$svc:latest"
+          done
+
+  # ===========================================================
+  # ETAPA 4 - DEPLOY EN EKS
+  # ===========================================================
+  deploy:
+    name: Deploy en EKS
+    runs-on: ubuntu-latest
+    needs: push
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales de AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -24,44 +104,31 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: 3. Login en Amazon ECR
-        id: login-ecr # Le damos un ID claro para usar sus outputs
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: 4. Construir y subir la imagen
-        env:
-          # Usamos el output automático del paso anterior, eliminando la necesidad de AWS_ACCOUNT_ID
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t "$REGISTRY/$REPOSITORY:$IMAGE_TAG" -t "$REGISTRY/$REPOSITORY:latest" .
-          docker push "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
-          docker push "$REGISTRY/$REPOSITORY:latest"
-
-      - name: 5. Instalar kubectl en el runner
+      - name: Instalar kubectl
         run: |
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/kubectl
 
-      - name: 6. Conectar kubectl al cluster
-        run: aws eks update-kubeconfig --name "${{ env.CLUSTER_NAME }}" --region "${{ env.AWS_REGION }}"
+      - name: Conectar kubectl al cluster
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
 
-      - name: 7. Desplegar en EKS
+      - name: Aplicar manifests
         env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          # Modificado para que reemplace correctamente usando el formato del registro dinámico
-          sed -i "s|image:.*|image: $REGISTRY/$REPOSITORY:$IMAGE_TAG|g" k8s/deployment.yaml
-          kubectl apply -f k8s/deployment.yaml
-          kubectl apply -f k8s/service.yaml
-          kubectl apply -f k8s/hpa.yaml
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          for svc in products-service inventory-service orders-service; do
+            sed -i "s|<ACCOUNT_ID>|$ACCOUNT_ID|g; s|<REGION>|$AWS_REGION|g; s|$svc:latest|$svc:$IMAGE_TAG|g" "$svc/k8s/deployment.yaml"
+            kubectl apply -f "$svc/k8s/deployment.yaml"
+            kubectl apply -f "$svc/k8s/service.yaml"
+          done
+          kubectl apply -f orders-service-lb.yaml
 
-      - name: 8. Verificar rollout
+      - name: Verificar rollout y mostrar URL
         run: |
-          # Nota: Asegúrate de que el deployment en tu archivo yaml se llame exactamente así, o cámbialo por apuestas-service si estás probando ese.
-          kubectl rollout status deployment/estadisticas-service --timeout=300s
-          kubectl get pods -l app=estadisticas-service -o wide
+          kubectl rollout status deployment/products-service --timeout=180s
+          kubectl rollout status deployment/inventory-service --timeout=180s
+          kubectl rollout status deployment/orders-service --timeout=180s
+          echo "URL pública del LoadBalancer:"
+          kubectl get svc orders-service-lb -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo
