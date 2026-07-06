@@ -55,27 +55,32 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: 3. Instalar kubectl
+      - name: 3. Login en Amazon ECR (de nuevo, en este job)
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 4. Instalar kubectl
         run: |
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/kubectl
 
-      - name: 4. Conectar kubectl al cluster
+      - name: 5. Conectar kubectl al cluster
         run: aws eks update-kubeconfig --name "${{ env.CLUSTER_NAME }}" --region "${{ env.AWS_REGION }}"
 
-      - name: 5. Desplegar en EKS
+      - name: 6. Desplegar en EKS
         env:
-          REGISTRY: ${{ needs.build-and-push.outputs.registry }}
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          echo "Imagen a desplegar: $REGISTRY/$REPOSITORY:$IMAGE_TAG"
           sed -i "s|image:.*|image: $REGISTRY/$REPOSITORY:$IMAGE_TAG|g" k8s/deployment.yaml
           kubectl apply -f k8s/deployment.yaml
           kubectl apply -f k8s/service.yaml
           kubectl apply -f k8s/hpa.yaml
 
-      - name: 6. Verificar rollout
+      - name: 7. Verificar rollout
         run: |
-          kubectl rollout status deployment/estadisticas-service --timeout=300s
-          kubectl get pods -l app=estadisticas-service -o wide
+          kubectl rollout status deployment/apuestas-service --timeout=300s
+          kubectl get pods -l app=apuestas-service -o wide
